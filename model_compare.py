@@ -17,6 +17,33 @@ import urllib.request
 
 
 PROTOCOLS = {"openai-responses", "openai-chat", "anthropic-messages", "gemini-generate-content"}
+EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+def model_config(value):
+    """Normalize old string entries and new per-model options."""
+    if isinstance(value, str) and value:
+        return {"id": value, "thinking": {"mode": "default"}}
+    if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not value["id"]:
+        raise ValueError("模型须为非空 ID 字符串，或含 id 的对象")
+    if set(value) - {"id", "thinking"}:
+        raise ValueError("模型对象只支持 id 和 thinking")
+    thinking = value.get("thinking", {"mode": "default"})
+    if not isinstance(thinking, dict) or set(thinking) - {"mode", "effort", "budget_tokens"}:
+        raise ValueError("thinking 须为只含 mode、effort、budget_tokens 的对象")
+    mode = thinking.get("mode")
+    if mode not in {"default", "on", "off"}:
+        raise ValueError("thinking.mode 须为 default、on 或 off")
+    effort = thinking.get("effort")
+    budget = thinking.get("budget_tokens")
+    if effort is not None and effort not in EFFORTS:
+        raise ValueError(f"thinking.effort 无效；支持：{', '.join(sorted(EFFORTS))}")
+    if budget is not None and (type(budget) is not int or budget < 1):
+        raise ValueError("thinking.budget_tokens 须为正整数")
+    if mode != "on" and (effort is not None or budget is not None):
+        raise ValueError("只有 thinking.mode=on 才能设置 effort 或 budget_tokens")
+    return {"id": value["id"], "thinking": {"mode": mode, **({"effort": effort} if effort else {}),
+                                             **({"budget_tokens": budget} if budget is not None else {})}}
 
 
 def parse_target(value):
@@ -37,6 +64,10 @@ def load_config(path):
         protocol = profile.get("protocol")
         if protocol not in PROTOCOLS:
             raise ValueError(f"档案 {name} 的 protocol 无效；支持：{', '.join(sorted(PROTOCOLS))}")
+        token_field = profile.get("chat_max_tokens_field")
+        if token_field is not None and (protocol != "openai-chat" or
+                                        token_field not in {"max_tokens", "max_completion_tokens"}):
+            raise ValueError(f"档案 {name} 的 chat_max_tokens_field 只可用于 openai-chat")
         base_url = profile.get("base_url")
         parsed = urllib.parse.urlparse(base_url) if isinstance(base_url, str) else None
         if not parsed or parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.query or parsed.fragment:
@@ -49,11 +80,15 @@ def load_config(path):
         if not isinstance(profile[key_field], str):
             raise ValueError(f"档案 {name} 的 {key_field} 须为字符串")
         models = profile.get("models")
-        if not isinstance(models, dict) or not models or any(
-            not isinstance(alias, str) or not alias or not isinstance(model, str) or not model
-            for alias, model in models.items()
-        ):
-            raise ValueError(f"档案 {name} 的 models 须为别名到 API 模型 ID 的非空映射")
+        if not isinstance(models, dict) or not models:
+            raise ValueError(f"档案 {name} 的 models 须为非空映射")
+        for alias, model in models.items():
+            if not isinstance(alias, str) or not alias:
+                raise ValueError(f"档案 {name} 的模型别名不能为空")
+            try:
+                model_config(model)
+            except ValueError as exc:
+                raise ValueError(f"档案 {name} 的模型 {alias}：{exc}") from exc
     return profiles
 
 
@@ -102,9 +137,76 @@ def sse_events(response):
             yield json.loads(data)
 
 
-def make_request(profile, model, key, prompt, system, max_tokens):
+def apply_thinking(protocol, model, thinking, body, max_tokens):
+    """Translate explicit intent to native parameters; reject incompatible combinations."""
+    mode = thinking["mode"]
+    if mode == "default":
+        return
+    effort = thinking.get("effort")
+    budget = thinking.get("budget_tokens")
+    if protocol in ("openai-responses", "openai-chat"):
+        if budget is not None:
+            raise ValueError(f"{protocol} 不支持 thinking.budget_tokens；请用 effort")
+        value = "none" if mode == "off" else (effort or "medium")
+        if value == "none" and model.lower().startswith("gpt-6-astra"):
+            raise ValueError("GPT-6 Astra 不支持关闭思考（reasoning effort=none）")
+        if protocol == "openai-responses":
+            body["reasoning"] = {"effort": value}
+        else:
+            body["reasoning_effort"] = value
+    elif protocol == "anthropic-messages":
+        if effort == "minimal":
+            raise ValueError("Anthropic effort 不支持 minimal")
+        version = re.match(r"^claude-(?:opus|sonnet|haiku)-(\d+)(?:-(\d+))?", model.lower())
+        generation = (int(version.group(1)), int(version.group(2) or 0)) if version else None
+        if mode == "off":
+            body["thinking"] = {"type": "disabled"}
+        elif budget is not None:
+            if budget < 1024 or budget >= max_tokens:
+                raise ValueError("Anthropic 手动思考预算须至少 1024，且小于 --max-output-tokens")
+            if generation and generation >= (4, 7):
+                raise ValueError("此 Claude 模型不支持手动思考预算；请用 adaptive + effort")
+            body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        else:
+            if generation and generation <= (4, 5):
+                raise ValueError("此 Claude 模型不支持 adaptive；请设置 budget_tokens")
+            body["thinking"] = {"type": "adaptive"}
+        if effort:
+            body["output_config"] = {"effort": effort}
+    else:
+        model_lower = model.lower()
+        if mode == "off":
+            if not model_lower.startswith("gemini-2.5-flash"):
+                raise ValueError("Gemini GenerateContent 仅对已知可关闭思考的 2.5 Flash 系列支持 off")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+        elif budget is not None:
+            if effort is not None or model_lower.startswith("gemini-3"):
+                raise ValueError("Gemini thinkingBudget 不能与 effort 并用，也不适用于 Gemini 3 系列")
+            if model_lower.startswith("gemini-2.5-pro") and not 128 <= budget <= 32768:
+                raise ValueError("Gemini 2.5 Pro 的思考预算范围是 128–32768")
+            if model_lower.startswith("gemini-2.5-flash-lite") and not 512 <= budget <= 24576:
+                raise ValueError("Gemini 2.5 Flash-Lite 的思考预算范围是 512–24576")
+            if model_lower.startswith("gemini-2.5-flash") and budget > 24576:
+                raise ValueError("Gemini 2.5 Flash 的思考预算不能超过 24576")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budget}
+        elif model_lower.startswith("gemini-2.5"):
+            if effort is not None:
+                raise ValueError("Gemini 2.5 GenerateContent 用 budget_tokens 调强度，不能用 effort")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": -1}
+        elif effort is not None:
+            if effort not in {"minimal", "low", "medium", "high"}:
+                raise ValueError("Gemini thinkingLevel 只支持 minimal、low、medium、high")
+            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": effort.upper()}
+        elif model_lower.startswith("gemini-3"):
+            body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "HIGH"}
+        else:
+            raise ValueError("此 Gemini 模型要明确开启思考，请设置 effort 或 budget_tokens")
+
+
+def make_request(profile, model, key, prompt, system, max_tokens, thinking=None):
     protocol = profile["protocol"]
     base_url = profile["base_url"].rstrip("/")
+    thinking = thinking or {"mode": "default"}
     if protocol == "openai-responses":
         body = {"model": model, "input": prompt, "stream": True,
                 "max_output_tokens": max_tokens, "store": False}
@@ -117,7 +219,8 @@ def make_request(profile, model, key, prompt, system, max_tokens):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        body = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": True}
+        token_field = profile.get("chat_max_tokens_field", "max_tokens")
+        body = {"model": model, "messages": messages, token_field: max_tokens, "stream": True}
         url = f"{base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {key}"}
     elif protocol == "anthropic-messages":
@@ -135,6 +238,7 @@ def make_request(profile, model, key, prompt, system, max_tokens):
         safe_model = urllib.parse.quote(model, safe="-_.")
         url = f"{base_url}/models/{safe_model}:streamGenerateContent?alt=sse"
         headers = {"x-goog-api-key": key}
+    apply_thinking(protocol, model, thinking, body, max_tokens)
     headers.update({"Content-Type": "application/json", "Accept": "text/event-stream"})
     return urllib.request.Request(
         url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -189,15 +293,17 @@ def extract_event(protocol, event):
 
 
 def run_one(name, alias, profile, index, key, prompt, system, max_tokens, timeout):
-    model = profile["models"][alias]
+    spec = model_config(profile["models"][alias])
+    model, thinking = spec["id"], spec["thinking"]
     protocol = profile["protocol"]
     record = {"provider": name, "alias": alias, "model": model, "protocol": protocol,
-              "base_url": profile["base_url"], "run": index, "status": "ok",
+              "base_url": profile["base_url"], "thinking": thinking,
+              "run": index, "status": "ok",
               "ttft_ms": None, "total_ms": None, "input_tokens": None,
-              "output_tokens": None, "text": "", "error": None}
+              "output_tokens": None, "thinking_tokens": None, "text": "", "error": None}
     started = time.perf_counter()
     try:
-        request = make_request(profile, model, key, prompt, system, max_tokens)
+        request = make_request(profile, model, key, prompt, system, max_tokens, thinking)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             for event in sse_events(response):
                 delta, input_tokens, output_tokens, error = extract_event(protocol, event)
@@ -205,6 +311,17 @@ def run_one(name, alias, profile, index, key, prompt, system, max_tokens, timeou
                     record["input_tokens"] = input_tokens
                 if output_tokens is not None:
                     record["output_tokens"] = output_tokens
+                if protocol == "openai-responses" and event.get("type") == "response.completed":
+                    usage = (event.get("response") or {}).get("usage") or {}
+                    record["thinking_tokens"] = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+                elif protocol == "openai-chat":
+                    usage = event.get("usage") or {}
+                    if usage.get("completion_tokens_details"):
+                        record["thinking_tokens"] = usage["completion_tokens_details"].get("reasoning_tokens")
+                elif protocol == "gemini-generate-content":
+                    usage = event.get("usageMetadata") or {}
+                    if "thoughtsTokenCount" in usage:
+                        record["thinking_tokens"] = usage["thoughtsTokenCount"]
                 if error:
                     raise RuntimeError(str(error))
                 if delta:
@@ -228,6 +345,15 @@ def format_ms(value):
     return "—" if value is None else f"{value:,.0f}"
 
 
+def thinking_label(value):
+    parts = [value["mode"]]
+    if "effort" in value:
+        parts.append(value["effort"])
+    if "budget_tokens" in value:
+        parts.append(f"budget={value['budget_tokens']}")
+    return " / ".join(parts)
+
+
 def fenced(text):
     longest = max((len(item) for item in re.findall(r"`+", text)), default=0)
     fence = "`" * max(3, longest + 1)
@@ -238,8 +364,8 @@ def report_markdown(data):
     records = data["results"]
     lines = ["# 模型对比报告", "", f"时间：{data['created_at']}", "",
              "## 汇总", "",
-             "| 档案 | 模型别名 / ID | 协议 | 成功/总数 | 首字延迟中位数 (ms) | 总耗时中位数 (ms) | 输出 token 中位数 |",
-             "| --- | --- | --- | ---: | ---: | ---: | ---: |"]
+             "| 档案 | 模型别名 / ID | 协议 | 思考设置 | 成功/总数 | 首字延迟中位数 (ms) | 总耗时中位数 (ms) | 输出 token 中位数 |",
+             "| --- | --- | --- | --- | ---: | ---: | ---: | ---: |"]
     for target in data["models"]:
         provider, alias, model = target["provider"], target["alias"], target["model"]
         group = [r for r in records if r["provider"] == provider and r["alias"] == alias]
@@ -247,16 +373,17 @@ def report_markdown(data):
         def median(field):
             values = [r[field] for r in successful if r[field] is not None]
             return format_ms(statistics.median(values)) if values else "—"
-        lines.append(f"| {provider} | {alias} / {model} | {target['protocol']} | {len(successful)}/{len(group)} | "
+        lines.append(f"| {provider} | {alias} / {model} | {target['protocol']} | {thinking_label(target['thinking'])} | {len(successful)}/{len(group)} | "
                      f"{median('ttft_ms')} | {median('total_ms')} | {median('output_tokens')} |")
     lines += ["", "## 每次回答", ""]
     for r in records:
         lines += [f"### {r['provider']} / {r['alias']} ({r['model']}) / 第 {r['run']} 次", "",
-                  f"接口：{r['base_url']}；协议：{r['protocol']}", "",
+                  f"接口：{r['base_url']}；协议：{r['protocol']}；思考设置：{thinking_label(r['thinking'])}", "",
                   f"状态：{r['status']}；首字延迟：{format_ms(r['ttft_ms'])} ms；"
                   f"总耗时：{format_ms(r['total_ms'])} ms；"
                   f"输入/输出 token：{r['input_tokens'] if r['input_tokens'] is not None else '—'}/"
-                  f"{r['output_tokens'] if r['output_tokens'] is not None else '—'}", ""]
+                  f"{r['output_tokens'] if r['output_tokens'] is not None else '—'}；"
+                  f"思考 token：{r['thinking_tokens'] if r['thinking_tokens'] is not None else '—'}", ""]
         if r["error"]:
             lines += [f"错误：{r['error']}", ""]
         if r["text"]:
@@ -264,7 +391,7 @@ def report_markdown(data):
     lines += ["## 说明", "",
               "首字延迟是从本机发起 HTTP 请求到收到第一段可见文本的时间；总耗时是收到流结束的时间。"
               "网络、排队、缓存、推理方式和输出长度都会影响结果。"
-              "不同厂商的 token 计数口径不完全一致；内容质量需要人工判断。", ""]
+              "不同厂商的思考强度及 token 计数口径不完全一致；内容质量需要人工判断。", ""]
     return "\n".join(lines)
 
 
@@ -306,10 +433,14 @@ def main(argv=None):
             parser.error(f"档案 {name} 中没有模型别名：{alias}")
         try:
             keys[name] = api_key_for(profile)
+            spec = model_config(profile["models"][alias])
+            make_request(profile, spec["id"], keys[name], prompt, system,
+                         args.max_output_tokens, spec["thinking"])
         except ValueError as exc:
-            parser.error(str(exc))
-        models.append({"provider": name, "alias": alias, "model": profile["models"][alias],
-                       "protocol": profile["protocol"], "base_url": profile["base_url"]})
+            parser.error(f"{name}:{alias}：{exc}")
+        models.append({"provider": name, "alias": alias, "model": spec["id"],
+                       "thinking": spec["thinking"], "protocol": profile["protocol"],
+                       "base_url": profile["base_url"]})
     created_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     data = {"created_at": created_at, "prompt": prompt, "system": system,
             "models": models, "runs": args.runs, "max_output_tokens": args.max_output_tokens,

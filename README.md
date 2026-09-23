@@ -55,6 +55,41 @@ python3 model_compare.py \
 
 密钥推荐用 `api_key_env` 指定环境变量名，再在终端设置实际值，例如 `export MY_GATEWAY_API_KEY='你的密钥'`。也可在本地私有配置里用 `"api_key": "你的密钥"` 代替 `api_key_env`，两者只能选一个。不要分享带实际密钥的配置文件；输出报告不会写入密钥。
 
+## 思考模式与强度
+
+模型仍可写成字符串（使用厂商默认思考行为）。需要控制时，将该模型改为对象，分别设置 `id` 和 `thinking`。可以让多个别名指向同一个模型 ID，对比不同设置：
+
+```json
+"models": {
+  "normal": "gemini-2.5-flash",
+  "no_thinking": {"id": "gemini-2.5-flash", "thinking": {"mode": "off"}},
+  "budget_4096": {"id": "gemini-2.5-flash", "thinking": {"mode": "on", "budget_tokens": 4096}}
+}
+```
+
+`mode` 可以是 `default`（不发送思考参数）、`on` 或 `off`。`effort` 可选 `minimal`、`low`、`medium`、`high`、`xhigh`、`max`，但实际可用值取决于协议和模型。`budget_tokens` 是手动思考预算，只适用于支持预算的协议。不能在 `off` 或 `default` 下设置强度。
+
+| 协议 | `on` | `off` | 强度设置 |
+| --- | --- | --- | --- |
+| `openai-responses` | `reasoning.effort`，未填时用 `medium` | `reasoning.effort=none` | `effort`；不支持 `budget_tokens` |
+| `openai-chat` | `reasoning_effort`，未填时用 `medium` | `reasoning_effort=none` | `effort`；兼容服务可能不支持该字段 |
+| `anthropic-messages` | 默认发送 `thinking.type=adaptive`；填 `budget_tokens` 时改用手动 `enabled` | `thinking.type=disabled` | adaptive 使用 `output_config.effort`；旧模型可能要求手动预算 |
+| `gemini-generate-content` | Gemini 2.5 用 `thinkingBudget`；Gemini 3 系列用 `thinkingLevel` | 已知可关闭的 Gemini 2.5 Flash 系列发送 `thinkingBudget=0` | Gemini 2.5 用 `budget_tokens`；Gemini 3 系列用 `effort`（`minimal` 至 `high`） |
+
+这些值不是跨厂商等价的分数。某些模型不支持关闭思考或特定强度；本工具会在请求前拒绝已知不兼容的组合，其他模型级限制由 API 返回明确错误。例如 Gemini 2.5 Pro 和 Gemini 3 系列无法关闭思考；Claude 4.5 及更早模型不支持 adaptive，需设置 `budget_tokens`；Claude Opus/Sonnet 4.7 及部分更新型号不支持手动预算。思考会消耗输出 token，必要时提高 `--max-output-tokens`，避免还没生成可见回答就耗尽额度。[OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning) · [Claude thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking) · [Gemini thinking](https://ai.google.dev/gemini-api/docs/generate-content/thinking)
+
+示例配置已经给同一款 Gemini 模型准备了不同别名，可以直接横向比较：
+
+```bash
+python3 model_compare.py --config model-compare.json \
+  --prompt '请解释这个问题的解法。' \
+  --model gemini:fast_no_thinking \
+  --model gemini:fast_budget \
+  --max-output-tokens 8192
+```
+
+使用 `openai-chat` 的兼容服务时，默认发送 `max_tokens`。如果服务要求 `max_completion_tokens`，在供应商档案中增加 `"chat_max_tokens_field": "max_completion_tokens"`。
+
 ## 运行
 
 只测试自己配置的聚合服务时：
