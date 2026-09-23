@@ -1,0 +1,28 @@
+{
+  "providers": {
+    "openai": {
+      "protocol": "openai-responses",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "models": {"main": "gpt-5"}
+    },
+    "anthropic": {
+      "protocol": "anthropic-messages",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "models": {"main": "claude-sonnet-4-6"}
+    },
+    "gemini": {
+      "protocol": "gemini-generate-content",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "api_key_env": "GEMINI_API_KEY",
+      "models": {"fast": "gemini-2.5-flash"}
+    },
+    "my_gateway": {
+      "protocol": "openai-chat",
+      "base_url": "https://your-gateway.example/v1",
+      "api_key_env": "MY_GATEWAY_API_KEY",
+      "models": {"fast": "provider/model-id"}
+    }
+  }
+}
